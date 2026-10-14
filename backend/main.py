@@ -1,4 +1,5 @@
 """NeuroFocus API, authentication, and single-process interview signaling."""
+import asyncio
 import datetime
 import hmac
 import json
@@ -275,7 +276,6 @@ class RoomManager:
         return True
 
     async def join(self, room_id: str, websocket: WebSocket, user: dict):
-        await websocket.accept()
         async with self.lock:
             peers = self.rooms.setdefault(room_id, [])
             if len(peers) >= 2 or any(peer["user"]["role"] == user["role"] for peer in peers):
@@ -341,18 +341,30 @@ def room_availability(room_id: str, current=Depends(get_current_user)):
 
 
 @app.websocket("/ws/{room_id}")
-async def room_socket(websocket: WebSocket, room_id: str, token: str):
+async def room_socket(websocket: WebSocket, room_id: str):
+    # Authenticate through the first WebSocket message instead of a URL query
+    # parameter, which can be retained in proxy and access logs.
+    await websocket.accept()
     try:
-        user = decode_token(token)
-    except HTTPException:
-        await websocket.close(code=4401)
+        auth_message = await asyncio.wait_for(websocket.receive_text(), timeout=10)
+        if len(auth_message) > 4096:
+            await websocket.close(code=1009, reason="Authentication message too large")
+            return
+        auth_data = json.loads(auth_message)
+        if not isinstance(auth_data, dict) or auth_data.get("type") != "auth" or not isinstance(auth_data.get("token"), str):
+            await websocket.close(code=4401, reason="Authentication required")
+            return
+        user = decode_token(auth_data["token"])
+    except (asyncio.TimeoutError, json.JSONDecodeError, HTTPException):
+        await websocket.close(code=4401, reason="Authentication failed")
+        return
+    except WebSocketDisconnect:
         return
     room_id = room_id.upper()
     if not ROOM_CODE.fullmatch(room_id):
         await websocket.close(code=4400, reason="Invalid room code")
         return
     if not manager.has_code(room_id):
-        await websocket.accept()
         await websocket.send_json({"type": "system", "event": "invalid_room"})
         await websocket.close(code=4404, reason="Room code not found or expired")
         return

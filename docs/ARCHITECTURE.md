@@ -167,4 +167,5 @@ This log reflects the automated smoke run on 2026-10-13. Browser media, actual v
 | NF-20 | Answer validation | Submit an unknown question ID or answer twice | Backend rejects unknown/duplicate answers; valid answer reaches HR with a language label | Passed: WebSocket validation tested | `backend/smoke_test.py`, 2026-10-13 |
 | NF-21 | Production HR registration | Register HR without invite, then with configured invite | Missing invite rejected; valid invite accepted; candidates can register normally | Passed: API smoke test | `backend/smoke_test.py`, 2026-10-13 |
 | NF-22 | ICE restart signaling | Candidate requests normal renegotiation and ICE restart | Authenticated room relay preserves restart flag for HR offerer | Passed: WebSocket smoke test | `backend/smoke_test.py`, 2026-10-13 |
+| NF-23 | WebSocket authentication | Connect without a JWT query parameter; send a valid or invalid first auth message | Valid JWT joins authorized room; invalid JWT is closed; URL contains no bearer token | Passed: WebSocket/API smoke test | `backend/smoke_test.py`, 2026-10-14 |
 

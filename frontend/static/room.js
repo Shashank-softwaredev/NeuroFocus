@@ -26,6 +26,8 @@ let qualityTimer = null;
 let reconnectTimer = null;
 let previewTimer = null;
 let localVideoTimer = null;
+let previewFrameReady = false;
+let localVideoFrameReady = false;
 let lastConnectionState = "";
 let events = [];
 const questionCards = new Map();
@@ -52,10 +54,33 @@ function setPermissionStatus(text, kind = "") {
 
 function setJoinEnabled() {
   const preview = $("preview-video");
-  const previewHasFrames = preview.videoWidth > 0 && preview.videoHeight > 0 && !preview.paused;
-  const hasCamera = Boolean(previewHasFrames && localStream?.getVideoTracks().some((track) => track.readyState === "live" && !track.muted));
+  const hasCamera = Boolean(previewFrameReady && preview.videoWidth > 0 && !preview.paused && localStream?.getVideoTracks().some((track) => track.readyState === "live" && !track.muted && track.enabled));
   const hasMicrophone = Boolean(localStream?.getAudioTracks().some((track) => track.readyState === "live"));
   $("join-room-btn").disabled = !(hasCamera && hasMicrophone && $("consent-check").checked);
+}
+
+function waitForVideoFrame(video, track, timeoutMs = 5000) {
+  return new Promise((resolve) => {
+    let settled = false;
+    let timeout;
+    const finish = (ready) => {
+      if (settled) return;
+      settled = true;
+      window.clearTimeout(timeout);
+      resolve(Boolean(ready && video.videoWidth > 0 && video.videoHeight > 0 && track?.readyState === "live" && !track.muted && track.enabled));
+    };
+    timeout = window.setTimeout(() => finish(false), timeoutMs);
+    if (typeof video.requestVideoFrameCallback === "function") {
+      video.requestVideoFrameCallback(() => finish(true));
+      return;
+    }
+    const before = video.getVideoPlaybackQuality?.().totalVideoFrames;
+    const timeBefore = video.currentTime;
+    window.setTimeout(() => {
+      const after = video.getVideoPlaybackQuality?.().totalVideoFrames;
+      finish(typeof before === "number" && typeof after === "number" ? after > before : video.currentTime > timeBefore);
+    }, 250);
+  });
 }
 
 function deviceOptions(select, devices, kind, selectedId) {
@@ -141,8 +166,33 @@ async function acquireMedia() {
   let audioStream;
   let videoError;
   let audioError;
-  try { videoStream = await captureMedia("video", videoDevice); } catch (error) { videoError = error; }
-  try { audioStream = await captureMedia("audio", audioDevice); } catch (error) { audioError = error; }
+  // Ask for both devices in one browser permission/capture transaction first.
+  // A modest baseline is more compatible with integrated and older laptop cameras;
+  // the selected-device and relaxed-constraint fallbacks below remain available.
+  const videoConstraints = {
+    ...(videoDevice ? { deviceId: { exact: videoDevice } } : {}),
+    width: { ideal: 640 },
+    height: { ideal: 480 },
+  };
+  const audioConstraints = {
+    ...(audioDevice ? { deviceId: { exact: audioDevice } } : {}),
+    echoCancellation: true,
+    noiseSuppression: true,
+    autoGainControl: true,
+  };
+  try {
+    const combined = await navigator.mediaDevices.getUserMedia({ video: videoConstraints, audio: audioConstraints });
+    videoStream = combined;
+    audioStream = combined;
+  } catch (error) {
+    // Permission and secure-context failures should be surfaced immediately.
+    // Other device/constraint failures can still leave one device usable, so
+    // retry each independently using the existing compatibility ladder.
+    if (error.name === "NotAllowedError") throw new Error("Camera or microphone permission was denied. Allow both for this site in browser settings, then refresh the device check.");
+    if (error.name === "SecurityError") throw new Error("Camera and microphone require HTTPS or localhost. Open the interview from a secure page.");
+    try { videoStream = await captureMedia("video", videoDevice); } catch (videoFailure) { videoError = videoFailure; }
+    try { audioStream = await captureMedia("audio", audioDevice); } catch (audioFailure) { audioError = audioFailure; }
+  }
   if (!videoStream && !audioStream) {
     throw new Error([videoError && mediaErrorMessage("video", videoError), audioError && mediaErrorMessage("audio", audioError)].filter(Boolean).join(" "));
   }
@@ -153,26 +203,16 @@ async function acquireMedia() {
   const old = localStream;
   localStream = replacement;
   const preview = $("preview-video");
+  previewFrameReady = false;
+  setJoinEnabled();
   preview.srcObject = videoTracks.length ? replacement : null;
   preview.muted = true;
   preview.playsInline = true;
   const deviceIssues = [videoError && mediaErrorMessage("video", videoError), audioError && mediaErrorMessage("audio", audioError)].filter(Boolean);
-  const confirmPreview = () => {
-    if (preview.videoWidth > 0 && !preview.paused) {
-      window.clearTimeout(previewTimer);
-      previewTimer = null;
-      setJoinEnabled();
-      setPermissionStatus(deviceIssues.length ? `Camera preview is live. ${deviceIssues.join(" ")}` : "Camera frames are visible. Check your microphone, then join when you’re comfortable.", deviceIssues.length ? "warning" : "good");
-      return true;
-    }
-    return false;
-  };
   if (videoTracks.length) {
-    preview.onloadeddata = confirmPreview;
-    preview.onplaying = confirmPreview;
     window.clearTimeout(previewTimer);
     previewTimer = window.setTimeout(() => {
-      if (preview.srcObject === replacement && preview.videoWidth === 0) {
+      if (preview.srcObject === replacement && !previewFrameReady) {
         setPermissionStatus("Camera opened but no video frames arrived. Choose another camera, close camera apps, or retry.", "error");
         setJoinEnabled();
       }
@@ -180,15 +220,27 @@ async function acquireMedia() {
     try {
       await preview.play();
       preview.onclick = null;
-      if (!confirmPreview()) setPermissionStatus(deviceIssues.length ? deviceIssues.join(" ") : "Camera and microphone connected. Waiting for camera frames before you can join…", deviceIssues.length ? "error" : "warning");
+      previewFrameReady = await waitForVideoFrame(preview, videoTracks[0]);
+      window.clearTimeout(previewTimer);
+      previewTimer = null;
+      setJoinEnabled();
+      setPermissionStatus(previewFrameReady
+        ? (deviceIssues.length ? `Camera preview is live. ${deviceIssues.join(" ")}` : "Live camera frame received. Check your microphone, then join when you’re comfortable.")
+        : "Camera opened, but no fresh video frame arrived. Check the camera privacy shutter, close other camera apps, or choose another device.", previewFrameReady && !deviceIssues.length ? "good" : "error");
     } catch (error) {
+      previewFrameReady = false;
       setPermissionStatus("Camera is ready, but preview playback was blocked. Click the preview to start it.", "error");
       preview.onclick = () => preview.play().then(() => {
         preview.onclick = null;
-        confirmPreview();
+        return waitForVideoFrame(preview, videoTracks[0]);
+      }).then((ready) => {
+        previewFrameReady = ready;
+        setJoinEnabled();
+        setPermissionStatus(ready ? "Live camera frame received. Check your microphone, then join when you’re comfortable." : "No fresh camera frame received. Check the camera privacy shutter or choose another device.", ready ? "good" : "error");
       }).catch((playError) => setPermissionStatus("Preview playback is still blocked: " + playError.message + ". Check this site’s browser permission.", "error"));
     }
   } else {
+    previewFrameReady = false;
     preview.onclick = null;
     window.clearTimeout(previewTimer);
     preview.srcObject = null;
@@ -197,7 +249,7 @@ async function acquireMedia() {
   audioTracks[0]?.addEventListener("ended", onLocalMicrophoneEnded);
   old?.getTracks().forEach((track) => track.stop());
   await refreshDeviceLists();
-  if (deviceIssues.length && (!videoTracks.length || preview.videoWidth === 0)) {
+  if (deviceIssues.length && (!videoTracks.length || !previewFrameReady)) {
     setPermissionStatus(deviceIssues.join(" "), "error");
   } else if (!videoTracks.length) {
     setPermissionStatus("Microphone is ready. Camera access is required before joining the interview.", "error");
@@ -256,10 +308,6 @@ async function connectInterview() {
     headers: { Authorization: `Bearer ${auth.token}` },
   });
   const iceConfig = iceResponse.ok ? await iceResponse.json() : { iceServers: [{ urls: "stun:stun.l.google.com:19302" }] };
-  if (!iceConfig.turnConfigured) {
-    showMessage("TURN relay is not configured. Calls may work on some separate networks but restrictive networks can fail. Configure a verified TURN service before relying on cross-network calls.", "warning");
-    if (auth.role === "hr") addEvent("TURN relay is not configured. Cross-network connectivity is not guaranteed.", "review");
-  }
   pc = new RTCPeerConnection({ iceServers: iceConfig.iceServers });
   localStream.getTracks().forEach((track) => pc.addTrack(track, localStream));
   pc.onicecandidate = ({ candidate }) => {
@@ -346,15 +394,15 @@ async function connectInterview() {
     else send({ type: "renegotiate_request" });
   };
   openSocket();
-  $("conn-pill").textContent = "Waiting for interviewer";
+  $("conn-pill").textContent = "Connecting to interview room…";
 }
 
 function openSocket() {
   const protocol = location.protocol === "https:" ? "wss" : "ws";
-  ws = new WebSocket(`${protocol}://${location.host}/ws/${encodeURIComponent(roomId)}?token=${encodeURIComponent(auth.token)}`);
+  ws = new WebSocket(`${protocol}://${location.host}/ws/${encodeURIComponent(roomId)}`);
   ws.onopen = () => {
-    $("conn-pill").textContent = "Waiting for interview partner";
-    send({ type: "room_event", event: "peer_connected" });
+    $("conn-pill").textContent = "Authenticating room access…";
+    ws.send(JSON.stringify({ type: "auth", token: auth.token }));
   };
   ws.onerror = () => showMessage("The room signaling connection could not be reached.", "error");
   ws.onclose = (event) => {
@@ -370,6 +418,7 @@ function openSocket() {
     if (msg.type === "system") {
       if (msg.event === "room_full") return;
       if (msg.event === "room_state") {
+        send({ type: "room_event", event: "peer_connected" });
         peerPresent = msg.peers.some((peer) => peer.role !== auth.role);
         if (peerPresent) {
           remoteCameraEnabled = true;
@@ -379,6 +428,8 @@ function openSocket() {
           $("remote-tag").textContent = partner?.name || "Interview partner";
           $("conn-pill").textContent = "Partner is in the room";
           if (auth.role === "hr") makeOffer();
+        } else {
+          $("conn-pill").textContent = "Waiting for interview partner";
         }
       } else if (msg.event === "peer_joined") {
         peerPresent = true;
@@ -526,7 +577,7 @@ function attachLocalVideo() {
   const placeholderText = $("local-placeholder").querySelector("span:last-child");
   const showFrame = () => {
     const track = localStream?.getVideoTracks()[0];
-    if (video.videoWidth > 0 && video.videoHeight > 0 && track?.readyState === "live" && !track.muted && track.enabled) {
+    if (localVideoFrameReady && video.videoWidth > 0 && video.videoHeight > 0 && track?.readyState === "live" && !track.muted && track.enabled) {
       cameraEnabled = true;
       updateCameraButton(true);
       window.clearTimeout(localVideoTimer);
@@ -538,24 +589,37 @@ function attachLocalVideo() {
     }
     return false;
   };
-  video.onloadeddata = showFrame;
-  video.onplaying = showFrame;
   const cameraTrack = localStream?.getVideoTracks()[0];
+  localVideoFrameReady = false;
   cameraTrack?.addEventListener("mute", () => {
     if (left) return;
+    localVideoFrameReady = false;
     $("local-placeholder").hidden = false;
     placeholderText.textContent = "Camera signal interrupted…";
     $("local-video-status").textContent = "Camera interrupted";
     $("reconnect-camera").hidden = false;
   });
-  cameraTrack?.addEventListener("unmute", () => {
-    if (!showFrame()) placeholderText.textContent = "Resuming your camera…";
+  cameraTrack?.addEventListener("unmute", async () => {
+    if (left) return;
+    localVideoFrameReady = await waitForVideoFrame(video, cameraTrack);
+    if (!showFrame()) {
+      placeholderText.textContent = "No fresh camera frames received. Check the camera and retry.";
+      $("local-video-status").textContent = "No camera frames";
+      $("reconnect-camera").hidden = false;
+    }
   });
   video.srcObject = localStream;
   video.onclick = () => video.play().then(showFrame).catch((error) => showMessage("Local video playback is blocked: " + error.message, "error"));
   $("local-placeholder").hidden = false;
   placeholderText.textContent = "Starting your camera…";
-  video.play().then(() => { if (!showFrame()) $("local-video-status").textContent = "Waiting for camera frames…"; })
+  video.play().then(async () => {
+    localVideoFrameReady = await waitForVideoFrame(video, cameraTrack);
+    if (!showFrame()) {
+      placeholderText.textContent = localVideoFrameReady ? "Camera preview unavailable" : "No fresh camera frames received. Check the camera and retry.";
+      $("local-video-status").textContent = localVideoFrameReady ? "Camera preview unavailable" : "No camera frames";
+      $("reconnect-camera").hidden = false;
+    }
+  })
     .catch((error) => {
       placeholderText.textContent = "Camera preview did not start. Check the selected device and browser permission, then rejoin.";
       $("local-video-status").textContent = error.name === "NotAllowedError" ? "Camera playback blocked" : "Camera unavailable";
@@ -742,6 +806,28 @@ $("cam-btn").addEventListener("click", () => {
   cameraEnabled = !cameraEnabled;
   tracks.forEach((track) => { track.enabled = cameraEnabled; });
   updateCameraButton(cameraEnabled);
+  if (!cameraEnabled) {
+    localVideoFrameReady = false;
+    $("local-placeholder").hidden = false;
+    $("local-placeholder").querySelector("span:last-child").textContent = "Camera off";
+  } else {
+    $("local-placeholder").hidden = false;
+    $("local-placeholder").querySelector("span:last-child").textContent = "Resuming your camera…";
+    waitForVideoFrame($("local-video"), tracks[0]).then((ready) => {
+      localVideoFrameReady = ready;
+      if (ready) {
+        $("local-placeholder").hidden = true;
+        $("local-video-status").textContent = "";
+        $("reconnect-camera").hidden = true;
+      } else {
+        cameraEnabled = false;
+        updateCameraButton(false);
+        $("local-placeholder").querySelector("span:last-child").textContent = "No fresh camera frames received. Check the camera and retry.";
+        $("local-video-status").textContent = "No camera frames";
+        $("reconnect-camera").hidden = false;
+      }
+    });
+  }
   $("local-video-status").textContent = cameraEnabled ? "" : "Camera off";
   const eventName = `${auth.role === "hr" ? "hr" : "candidate"}_camera_${cameraEnabled ? "on" : "off"}`;
   reportEvent(eventName);

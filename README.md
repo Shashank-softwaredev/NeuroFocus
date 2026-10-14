@@ -15,7 +15,7 @@ NeuroFocus is a web prototype for remote, one-to-one interviews between an HR us
 | HR event log | Two-second local connection/RTT samples and relayed session events; CSV export; not visible to candidates |
 | Storage | SQLite locally; PostgreSQL using `DATABASE_URL` when deployed |
 
-Room membership and WebSocket connections are held in memory by a single application process. Keep the Render service at one instance for this prototype; restarting/redeploying the service ends active rooms. User accounts are stored in the configured database.
+Room membership and WebSocket connections are held in memory by a single application process. Keep the Render service at one instance for this prototype; restarting/redeploying the service ends active rooms. User accounts are stored in the configured database. WebSocket authentication is sent as the first WSS message rather than as a JWT in the request URL, reducing token exposure in URL/access logs.
 
 ## Run locally on Windows
 

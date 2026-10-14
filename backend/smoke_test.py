@@ -6,6 +6,7 @@ import tempfile
 import time
 import unittest
 import uuid
+from contextlib import contextmanager
 
 TEST_DIR = tempfile.TemporaryDirectory(prefix="neurofocus-smoke-")
 os.environ["ENVIRONMENT"] = "development"
@@ -26,6 +27,12 @@ class NeuroFocusSmokeTests(unittest.TestCase):
         cls.hr = cls.client.post("/api/register", json={"name": "HR Demo", "email": cls.hr_email, "password": "TestPass123", "role": "hr"})
         cls.candidate = cls.client.post("/api/register", json={"name": "Candidate Demo", "email": cls.candidate_email, "password": "TestPass123", "role": "candidate"})
 
+    @contextmanager
+    def authenticated_socket(self, room, token):
+        with self.client.websocket_connect(f"/ws/{room}") as websocket:
+            websocket.send_json({"type": "auth", "token": token})
+            yield websocket
+
     def test_health_and_frontend(self):
         self.assertEqual(self.client.get("/health").json(), {"status": "ok"})
         page = self.client.get("/room.html")
@@ -36,6 +43,8 @@ class NeuroFocusSmokeTests(unittest.TestCase):
         self.assertEqual(script.status_code, 200)
         self.assertEqual(script.headers.get("cache-control"), "no-store")
         self.assertIn("attachLocalVideo", script.text)
+        self.assertNotIn("?token=", script.text)
+        self.assertIn('type: "auth", token: auth.token', script.text)
         revalidated = self.client.get("/static/room.js", headers={"If-None-Match": '"stale-browser-copy"'})
         self.assertEqual(revalidated.status_code, 200)
 
@@ -104,12 +113,17 @@ class NeuroFocusSmokeTests(unittest.TestCase):
         room = created.json()["room"]
         self.assertRegex(room, r"^NF-[A-HJ-NP-Z2-9]{6}$")
         self.assertEqual(self.client.post("/api/rooms", json={}).status_code, 401)
-        with self.client.websocket_connect(f"/ws/NF-ABCDEF?token={self.hr.json()['token']}") as invalid_ws:
+        with self.authenticated_socket("NF-ABCDEF", self.hr.json()["token"]) as invalid_ws:
             self.assertEqual(invalid_ws.receive_json()["event"], "invalid_room")
-        with self.client.websocket_connect(f"/ws/{room}?token={self.hr.json()['token']}") as hr_ws:
+        with self.client.websocket_connect(f"/ws/{room}") as unauthenticated_ws:
+            unauthenticated_ws.send_json({"type": "auth", "token": "invalid-token"})
+            close_message = unauthenticated_ws.receive()
+            self.assertEqual(close_message["type"], "websocket.close")
+            self.assertEqual(close_message["code"], 4401)
+        with self.authenticated_socket(room, self.hr.json()["token"]) as hr_ws:
             self.assertEqual(hr_ws.receive_json()["event"], "room_state")
             time.sleep(15)  # Reproduce the reported delayed-candidate join.
-            with self.client.websocket_connect(f"/ws/{room}?token={self.candidate.json()['token']}") as candidate_ws:
+            with self.authenticated_socket(room, self.candidate.json()["token"]) as candidate_ws:
                 candidate_state = candidate_ws.receive_json()
                 self.assertEqual(candidate_state["event"], "room_state")
                 self.assertEqual(candidate_state["peers"][0]["role"], "hr")
@@ -148,14 +162,14 @@ class NeuroFocusSmokeTests(unittest.TestCase):
                 ice_restart = hr_ws.receive_json()
                 self.assertEqual(ice_restart["type"], "renegotiate_request")
                 self.assertTrue(ice_restart["restart_ice"])
-                with self.client.websocket_connect(f"/ws/{room}?token={self.hr.json()['token']}") as extra_ws:
+                with self.authenticated_socket(room, self.hr.json()["token"]) as extra_ws:
                     self.assertEqual(extra_ws.receive_json()["event"], "room_full")
             self.assertEqual(hr_ws.receive_json()["event"], "peer_left")
 
         reverse_room = self.client.post("/api/rooms", headers=hr_headers, json={}).json()["room"]
-        with self.client.websocket_connect(f"/ws/{reverse_room}?token={self.candidate.json()['token']}") as candidate_ws:
+        with self.authenticated_socket(reverse_room, self.candidate.json()["token"]) as candidate_ws:
             self.assertEqual(candidate_ws.receive_json()["event"], "room_state")
-            with self.client.websocket_connect(f"/ws/{reverse_room}?token={self.hr.json()['token']}") as hr_ws:
+            with self.authenticated_socket(reverse_room, self.hr.json()["token"]) as hr_ws:
                 hr_state = hr_ws.receive_json()
                 self.assertEqual(hr_state["event"], "room_state")
                 self.assertEqual(hr_state["peers"][0]["role"], "candidate")
